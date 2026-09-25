@@ -11,7 +11,7 @@ import subprocess
 subprocess.run([
     "pip", "install", "-q",
     "trl==0.15.2", "peft==0.20.0",
-    "bitsandbytes>=0.43.0", "openai>=1.0.0",
+    "bitsandbytes>=0.43.0",
     "pandas", "numpy"
 ], check=True)
 
@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -42,14 +43,13 @@ for d in [DATA_DIR, ANNOT_DIR, SFT_DIR, GRPO_DIR]:
     os.makedirs(d, exist_ok=True)
 
 MODEL_ID        = "Qwen/Qwen2.5-1.5B-Instruct"
+ANNOTATION_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 FEATURES_PCA_PT = f"{DATA_DIR}/features_pca256.pt"
 LABELS_PT       = f"{DATA_DIR}/labels_bot.pt"
 EDGE_INDEX_PT   = f"{DATA_DIR}/edge_index.pt"
 EDGE_TYPE_PT    = f"{DATA_DIR}/edge_type.pt"
 GSI_CSV         = f"{DATA_DIR}/df_gsi.csv"
 FIM_CSV         = f"{DATA_DIR}/df_fim_raw.csv"
-
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "your-key-here")
 
 # ================================================================
 #  PHASE 0 — LOAD MGTAB & PRECOMPUTED FEATURES
@@ -118,31 +118,73 @@ print("\n" + "="*65)
 print("PHASE 1: DeepSeek Annotation")
 print("="*65)
 
-from openai import OpenAI
-
-deepseek_client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
+print(f"Loading annotation model: {ANNOTATION_MODEL_ID}")
+annotation_tokenizer = AutoTokenizer.from_pretrained(
+    ANNOTATION_MODEL_ID,
+    trust_remote_code=True,
 )
+if annotation_tokenizer.pad_token is None:
+    annotation_tokenizer.pad_token = annotation_tokenizer.eos_token
+annotation_tokenizer.padding_side = "left"
+
+if torch.cuda.is_available():
+    annotation_quantization = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    annotation_model = AutoModelForCausalLM.from_pretrained(
+        ANNOTATION_MODEL_ID,
+        quantization_config=annotation_quantization,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+else:
+    annotation_model = AutoModelForCausalLM.from_pretrained(
+        ANNOTATION_MODEL_ID,
+        torch_dtype=torch.float32,
+        trust_remote_code=True,
+    )
+annotation_model.eval()
 
 def call_deepseek(system_prompt: str,
                   user_prompt: str,
                   max_tokens: int = 300,
                   retries: int = 3) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     for attempt in range(retries):
         try:
-            resp = deepseek_client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[
-                    {"role": "system",  "content": system_prompt},
-                    {"role": "user",    "content": user_prompt},
-                ],
-                max_tokens=max_tokens,
-                temperature=0.3,
+            prompt = annotation_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"  DeepSeek error (attempt {attempt+1}): {e}")
+            inputs = annotation_tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=4096,
+            )
+            input_device = next(annotation_model.parameters()).device
+            inputs = {key: value.to(input_device) for key, value in inputs.items()}
+            with torch.inference_mode():
+                generated = annotation_model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=False,
+                    pad_token_id=annotation_tokenizer.pad_token_id,
+                )
+            new_tokens = generated[0, inputs["input_ids"].shape[1]:]
+            return annotation_tokenizer.decode(
+                new_tokens,
+                skip_special_tokens=True,
+            ).strip()
+        except Exception as error:
+            print(f"  DeepSeek local generation error (attempt {attempt + 1}): {error}")
             time.sleep(2 ** attempt)
     return ""
 
@@ -331,6 +373,8 @@ def annotate_gsi_sample(row: pd.Series) -> Optional[Dict]:
 # ── Run annotation (with checkpoint) ─────────────────────────────
 FIM_ANNOT = f"{ANNOT_DIR}/fim_annotations.jsonl"
 GSI_ANNOT = f"{ANNOT_DIR}/gsi_annotations.jsonl"
+FIM_ANNOTATED_CSV = f"{DATA_DIR}/df_fim_annotated.csv"
+GSI_ANNOTATED_CSV = f"{DATA_DIR}/df_gsi_annotated.csv"
 
 def load_existing(path: str) -> List[Dict]:
     if not os.path.exists(path):
@@ -344,11 +388,28 @@ def load_existing(path: str) -> List[Dict]:
                 except: pass
     return out
 
+def write_annotated_csv(records: List[Dict], path: str) -> None:
+    rows = []
+    for record in records:
+        row = dict(record)
+        messages = row.get("messages", [])
+        if "annotation" not in row and messages:
+            row["annotation"] = messages[-1].get("content", "")
+        if "messages" in row:
+            row["messages"] = json.dumps(row["messages"], ensure_ascii=False)
+        for key in ("full_path", "mediators", "mediator_ids"):
+            if isinstance(row.get(key), list):
+                row[key] = json.dumps(row[key], separators=(",", ":"))
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
 def run_fim_annotation(n_samples: int = 4000):
     existing = load_existing(FIM_ANNOT)
     done     = len(existing)
     print(f"  FIM: {done} already annotated, target={n_samples}")
     if done >= n_samples:
+        write_annotated_csv(existing, FIM_ANNOTATED_CSV)
+        print(f"  Saved annotated FIM CSV: {FIM_ANNOTATED_CSV}")
         print("  FIM annotation complete.")
         return
 
@@ -395,12 +456,16 @@ def run_fim_annotation(n_samples: int = 4000):
             if (i + 1) % 50 == 0:
                 total = done + i - done + 1
                 print(f"    FIM annotated: {total}/{n_samples}")
+    write_annotated_csv(load_existing(FIM_ANNOT), FIM_ANNOTATED_CSV)
+    print(f"  Saved annotated FIM CSV: {FIM_ANNOTATED_CSV}")
 
 def run_gsi_annotation(n_samples: int = 4000):
     existing = load_existing(GSI_ANNOT)
     done     = len(existing)
     print(f"  GSI: {done} already annotated, target={n_samples}")
     if done >= n_samples:
+        write_annotated_csv(existing, GSI_ANNOTATED_CSV)
+        print(f"  Saved annotated GSI CSV: {GSI_ANNOTATED_CSV}")
         print("  GSI annotation complete.")
         return
 
@@ -445,6 +510,8 @@ def run_gsi_annotation(n_samples: int = 4000):
             if (i + 1) % 50 == 0:
                 total = done + i - done + 1
                 print(f"    GSI annotated: {total}/{n_samples}")
+    write_annotated_csv(load_existing(GSI_ANNOT), GSI_ANNOTATED_CSV)
+    print(f"  Saved annotated GSI CSV: {GSI_ANNOTATED_CSV}")
 
 print("\nRunning FIM annotation...")
 run_fim_annotation(n_samples=4000)
@@ -458,21 +525,28 @@ VAL_JSONL   = f"{DATA_DIR}/val_v4.jsonl"
 
 def build_splits(fim_path, gsi_path,
                  train_out, val_out,
-                 val_ratio=0.1):
+                 validation_per_module=500):
     fim = load_existing(fim_path)
     gsi = load_existing(gsi_path)
     print(f"  FIM: {len(fim)} | GSI: {len(gsi)}")
 
-    # Keep only messages field for training
-    fim_msgs = [{"messages": x["messages"], "module": "FIM"} for x in fim]
-    gsi_msgs = [{"messages": x["messages"], "module": "GSI"} for x in gsi]
+    if len(fim) < validation_per_module or len(gsi) < validation_per_module:
+        raise ValueError(
+            f"Need at least {validation_per_module} FIM and GSI records for validation"
+        )
 
-    all_data = fim_msgs + gsi_msgs
-    random.shuffle(all_data)
+    rng = random.Random(42)
+    rng.shuffle(fim)
+    rng.shuffle(gsi)
 
-    n_val   = int(len(all_data) * val_ratio)
-    val     = all_data[:n_val]
-    train   = all_data[n_val:]
+    # Keep only the chat messages field for SFT.
+    fim_msgs = [{"messages": x["messages"]} for x in fim]
+    gsi_msgs = [{"messages": x["messages"]} for x in gsi]
+
+    val = fim_msgs[:validation_per_module] + gsi_msgs[:validation_per_module]
+    train = fim_msgs[validation_per_module:] + gsi_msgs[validation_per_module:]
+    rng.shuffle(train)
+    rng.shuffle(val)
 
     for path, data in [(train_out, train), (val_out, val)]:
         with open(path, "w") as f:
@@ -485,6 +559,11 @@ def build_splits(fim_path, gsi_path,
 
 print("\nBuilding train/val splits...")
 build_splits(FIM_ANNOT, GSI_ANNOT, TRAIN_JSONL, VAL_JSONL)
+
+del annotation_model, annotation_tokenizer
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 
 # ================================================================
