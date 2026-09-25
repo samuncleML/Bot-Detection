@@ -147,6 +147,9 @@ else:
         trust_remote_code=True,
     )
 annotation_model.eval()
+annotation_model.generation_config.do_sample = False
+annotation_model.generation_config.temperature = None
+annotation_model.generation_config.top_p = None
 
 def call_deepseek(system_prompt: str,
                   user_prompt: str,
